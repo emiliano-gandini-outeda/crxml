@@ -34,7 +34,6 @@ jobs:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
         run: |
           pip install maturin pytest pyarrow pandas polars
-          pip install rypipe
           maturin build --features testing --out /tmp/wheels -i python
           pip install /tmp/wheels/crxml-*.whl
 
@@ -69,7 +68,6 @@ jobs:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
         run: |
           pip install maturin pytest pyarrow pandas polars
-          pip install rypipe
           maturin build --out /tmp/wheels -i python
           pip install /tmp/wheels/crxml-*.whl
 
