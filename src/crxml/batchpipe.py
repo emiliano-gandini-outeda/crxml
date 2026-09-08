@@ -114,8 +114,19 @@ def _fuse_filter_spec(spec: dict):
     """Compile a FilterRows spec into a mask producer ANDed into the
     selection. Null semantics match the dict path: a missing (null) value
     compares unequal, so ``==`` drops it and ``!=`` keeps it.
+
+    Returns ``None`` for spec shapes this compiler does not support
+    (compound and/or/not trees, is_null, is_type); the caller then falls
+    back to the dict-stream path. Note compound specs normally never reach
+    here: ``plan_split`` pushes them into the Rust plan.
     """
     import pyarrow.compute as pc
+
+    if not (
+        ("field" in spec and "value" in spec)
+        or ("field_a" in spec and "field_b" in spec)
+    ):
+        return None
 
     if "field" in spec:
         field, op, value = spec["field"], spec["op"], spec["value"]
