@@ -25,8 +25,11 @@ wheels = [
 
 [[package]]
 name = "crxml"
-version = "2.0.0"
+version = "2.1.0"
 source = { editable = "." }
+dependencies = [
+    { name = "rypipe" },
+]
 
 [package.optional-dependencies]
 all = [
@@ -34,7 +37,6 @@ all = [
     { name = "pandas", version = "3.0.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "polars" },
     { name = "pyarrow" },
-    { name = "rypipe" },
 ]
 dev = [
     { name = "hypothesis" },
@@ -45,7 +47,6 @@ dev = [
     { name = "pyarrow" },
     { name = "pytest" },
     { name = "pytest-benchmark" },
-    { name = "rypipe" },
 ]
 docs = [
     { name = "seoslug" },
@@ -60,14 +61,11 @@ polars = [
 pyarrow = [
     { name = "pyarrow" },
 ]
-rypipe = [
-    { name = "rypipe" },
-]
 
 [package.metadata]
 requires-dist = [
     { name = "crxml", extras = ["all"], marker = "extra == 'dev'" },
-    { name = "crxml", extras = ["rypipe", "pyarrow", "pandas", "polars"], marker = "extra == 'all'" },
+    { name = "crxml", extras = ["pyarrow", "pandas", "polars"], marker = "extra == 'all'" },
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "openpyxl", marker = "extra == 'dev'", specifier = ">=3.1" },
     { name = "pandas", marker = "extra == 'pandas'", specifier = ">=1.5" },
@@ -75,10 +73,10 @@ requires-dist = [
     { name = "pyarrow", marker = "extra == 'pyarrow'", specifier = ">=15" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7" },
     { name = "pytest-benchmark", marker = "extra == 'dev'", specifier = ">=4" },
-    { name = "rypipe", marker = "extra == 'rypipe'", specifier = ">=0.1.0" },
+    { name = "rypipe", specifier = ">=0.1.0" },
     { name = "seoslug", marker = "extra == 'docs'", specifier = ">=2.0.1" },
 ]
-provides-extras = ["rypipe", "pyarrow", "pandas", "polars", "all", "docs", "dev"]
+provides-extras = ["pyarrow", "pandas", "polars", "all", "docs", "dev"]
 
 [[package]]
 name = "et-xmlfile"
