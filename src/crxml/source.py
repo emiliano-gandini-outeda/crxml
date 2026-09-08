@@ -65,12 +65,26 @@ def _validate_filter(f: dict) -> None:
     """Eagerly validate a pushdown filter spec (mirrors the Rust planner).
 
     Raises ``ValueError`` at construction time instead of deep inside a
-    later ``to_arrow()`` call.
+    later ``to_arrow()`` call. Accepts compound specs
+    (``{"and": [...]}`` / ``{"or": [...]}`` / ``{"not": ...}``) recursively.
     """
     if not isinstance(f, dict):
         raise ValueError(
             f"filter must be a dict, got {type(f).__name__}: {f!r}"
         )
+    for key in ("and", "or"):
+        if key in f:
+            subs = f[key]
+            if not isinstance(subs, (list, tuple)) or not subs:
+                raise ValueError(
+                    f"{key!r} filter expects a non-empty list of filter specs"
+                )
+            for s in subs:
+                _validate_filter(s)
+            return
+    if "not" in f:
+        _validate_filter(f["not"])
+        return
     op = f.get("op")
     if op is None:
         raise ValueError("filter must include an 'op' key")
@@ -87,7 +101,18 @@ def _validate_filter(f: dict) -> None:
                 f"> < >= <= == != (or gt lt ge le eq ne)"
             )
         return
-    if "field" not in f or "value" not in f:
+    if "field" not in f:
+        raise ValueError(
+            "filter requires either 'field' + 'op' + 'value', or "
+            "'field_a' + 'op' + 'field_b'"
+        )
+    if op == "is_null":
+        return
+    if op == "is_type":
+        if "value" not in f:
+            raise ValueError("is_type filter must include a 'value' key")
+        return
+    if "value" not in f:
         raise ValueError(
             "filter requires either 'field' + 'op' + 'value', or "
             "'field_a' + 'op' + 'field_b'"
@@ -258,7 +283,9 @@ class CrystalXMLSource(Adapter):
         engine = self._resolve_engine("table")
         plan = self._build_plan_kwargs()
         if plan_overrides:
-            plan.update(plan_overrides)
+            from .fusion import _merge_plan_kwargs
+
+            _merge_plan_kwargs(plan, plan_overrides)
         if (
             self._memory is not None
             and self._path.stat().st_size > self._memory
@@ -266,7 +293,9 @@ class CrystalXMLSource(Adapter):
         ):
             bounded_kwargs = self._build_bounded_kwargs()
             if plan_overrides:
-                bounded_kwargs.update(plan_overrides)
+                from .fusion import _merge_plan_kwargs
+
+                _merge_plan_kwargs(bounded_kwargs, plan_overrides)
             table = _core.read_to_columnar_bounded(
                 str(self._path), self._row_tag, self._memory,
                 **bounded_kwargs,
@@ -332,9 +361,6 @@ class CrystalXMLSource(Adapter):
             return _batch_iter(self._stream_iter(), batch_size=self._batch_size)
 
         return _arrow_iter(self._read_arrow())
-
-    def to_pandas(self, dtype_backend: str = "pyarrow") -> "pd.DataFrame":
-        return self.to_pandas(dtype_backend=dtype_backend)
 
     def to_arrow(self, combine: bool = False):
         """Return a ``pyarrow.Table``, optionally with chunked columns.
