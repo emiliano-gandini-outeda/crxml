@@ -3,39 +3,6 @@ import warnings
 from pathlib import Path
 from typing import Iterable
 
-def to_pandas(
-    pipeline: Iterable[dict],
-    chunksize: int | None = None,
-    dtype_backend: str = "pyarrow",
-) -> "pd.DataFrame":
-    """Convert a pipeline of records into a pandas DataFrame.
-
-    Uses Arrow-backed dtypes by default. When ``chunksize`` is given, records
-    are batched into intermediate DataFrames before concatenation to limit
-    peak memory.
-    """
-    import pandas as pd
-    types_mapper = pd.ArrowDtype if dtype_backend == "pyarrow" else None
-    if chunksize is None:
-        if hasattr(pipeline, "_to_arrow"):
-            table = pipeline._to_arrow()
-            if table is not None:
-                return table.to_pandas(types_mapper=types_mapper)
-        if hasattr(pipeline, "_iter_batches"):
-            chunks = [pd.DataFrame.from_records(batch) for batch in pipeline._iter_batches()]
-            return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
-        return pd.DataFrame.from_records(iter(pipeline))
-    chunks = []
-    batch = []
-    for rec in pipeline:
-        batch.append(rec)
-        if len(batch) >= chunksize:
-            chunks.append(pd.DataFrame.from_records(batch))
-            batch = []
-    if batch:
-        chunks.append(pd.DataFrame.from_records(batch))
-    return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
-
 def to_csv(
     pipeline: Iterable[dict],
     path: str | Path,
@@ -139,3 +106,8 @@ def to_parquet(pipeline: Iterable[dict], path: str | Path, **kwargs):
     """Write a pipeline or source to Parquet."""
     import pyarrow.parquet as pq
     pq.write_table(to_arrow(pipeline), str(path), **kwargs)
+
+
+def to_dataframe(pipeline: Iterable[dict], chunksize: int | None = None, dtype_backend: str = "pyarrow"):
+    """Alias for :func:`to_pandas`, kept for backward compatibility with crxml 2.1."""
+    return to_pandas(pipeline, chunksize=chunksize, dtype_backend=dtype_backend)
