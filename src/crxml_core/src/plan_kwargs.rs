@@ -1,0 +1,286 @@
+//! Recursive filter-spec parser: turns the Python `filter=` kwarg into a
+//! `rypipe_core::FilterPredicate` tree. Mirrors rypipe-python's
+//! `plan_kwargs.rs` so both packages accept the same spec shapes:
+//! compound `{"and": [...]}` / `{"or": [...]}` / `{"not": ...}` plus leaf
+//! specs (constant, column compare, is_null, is_type, membership, string
+//! transforms, length, compare-literal).
+
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
+use rypipe_core::{CompareOp, FieldType, FilterPredicate};
+
+use crate::PlanError;
+
+pub fn parse_filter_spec(spec: &Bound<'_, PyAny>) -> PyResult<FilterPredicate> {
+    let dict = spec.downcast::<PyDict>().map_err(|_| {
+        let ty = spec
+            .get_type()
+            .name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        PlanError::new_err(format!("filter spec must be a dict, got {ty}"))
+    })?;
+
+    // Compound forms take precedence over leaves.
+    if let Some(item) = dict.get_item("and")? {
+        return combine_list(&item, FilterPredicate::all, "'and'");
+    }
+    if let Some(item) = dict.get_item("or")? {
+        return combine_list(&item, FilterPredicate::any, "'or'");
+    }
+    if let Some(item) = dict.get_item("not")? {
+        let inner = parse_filter_spec(&item)?;
+        return Ok(FilterPredicate::not(inner));
+    }
+
+    parse_leaf_spec(dict)
+}
+
+/// Fold a list of sub-specs into an `And`/`Or` chain.
+fn combine_list(
+    item: &Bound<'_, PyAny>,
+    combiner: fn(FilterPredicate, FilterPredicate) -> FilterPredicate,
+    label: &str,
+) -> PyResult<FilterPredicate> {
+    let specs: Vec<Bound<'_, PyAny>> = item.extract().map_err(|_| {
+        PlanError::new_err(format!("{label} filter expects a list of filter specs"))
+    })?;
+    let mut iter = specs.into_iter();
+    let Some(first) = iter.next() else {
+        return Err(PlanError::new_err(format!(
+            "{label} filter requires at least one sub-filter"
+        )));
+    };
+    let mut acc = parse_filter_spec(&first)?;
+    for spec in iter {
+        acc = combiner(acc, parse_filter_spec(&spec)?);
+    }
+    Ok(acc)
+}
+
+/// Parse a flat leaf spec: constant (`field`/`op`/`value`), column
+/// comparison (`field_a`/`op`/`field_b`), null/type checks, membership,
+/// string transforms, length, or ordered compare-literal.
+fn parse_leaf_spec(f: &Bound<'_, PyDict>) -> PyResult<FilterPredicate> {
+    let op = f
+        .get_item("op")?
+        .ok_or_else(|| PlanError::new_err("filter must include 'op' key"))?
+        .extract::<String>()?;
+
+    // Always-true / always-false
+    if f.contains("always")? {
+        let val: bool = f.get_item("always")?.unwrap().extract()?;
+        return Ok(FilterPredicate::Always(val));
+    }
+
+    // Not-field (truthiness negation)
+    if f.contains("not_field")? {
+        let field: String = f.get_item("not_field")?.unwrap().extract()?;
+        return Ok(FilterPredicate::NotField { field });
+    }
+
+    // Column-to-column filter: field_a + op + field_b
+    if f.contains("field_a")? && f.contains("field_b")? {
+        let field_a: String = f.get_item("field_a")?.unwrap().extract()?;
+        let field_b: String = f.get_item("field_b")?.unwrap().extract()?;
+        let cop = CompareOp::from_str(&op).ok_or_else(|| {
+            let valid = ">, <, >=, <=, ==, !=";
+            PlanError::new_err(format!("unsupported compare op {op:?}; valid: {valid}"))
+        })?;
+        return Ok(FilterPredicate::Compare {
+            field_a,
+            op: cop,
+            field_b,
+        });
+    }
+
+    // Replace: field + old + new + cmp_op + value
+    if f.contains("old")? && f.contains("new")? {
+        let field: String = f.get_item("field")?.unwrap().extract()?;
+        let old: String = f.get_item("old")?.unwrap().extract()?;
+        let new: String = f.get_item("new")?.unwrap().extract()?;
+        let value = f
+            .get_item("value")?
+            .ok_or_else(|| PlanError::new_err("replace filter must include 'value' key"))?
+            .extract::<String>()?;
+        let cmp_op_str = if let Some(cmp) = f.get_item("cmp_op")? {
+            cmp.extract::<String>()?
+        } else {
+            op.clone()
+        };
+        let cop = CompareOp::from_str(&cmp_op_str).ok_or_else(|| {
+            let valid = "==, eq, !=, ne, >, gt, <, lt, >=, ge, <=, le";
+            PlanError::new_err(format!(
+                "unsupported compare op {cmp_op_str:?}; valid: {valid}"
+            ))
+        })?;
+        return Ok(FilterPredicate::Replace {
+            field,
+            old,
+            new,
+            op: cop,
+            value,
+        });
+    }
+
+    // Collection membership: field + op + values
+    if f.contains("values")? {
+        let field: String = f.get_item("field")?.unwrap().extract()?;
+        let values_py = f.get_item("values")?.unwrap();
+        let values: Vec<String> = values_py.extract()?;
+        return Ok(match op.as_str() {
+            "in" => FilterPredicate::In { field, values },
+            "not_in" => FilterPredicate::NotIn { field, values },
+            _ => {
+                let valid = "in, not_in";
+                return Err(PlanError::new_err(format!(
+                    "unsupported collection op {op:?}; valid: {valid}"
+                )));
+            }
+        });
+    }
+
+    // Null check: field + op="is_null"
+    if op == "is_null" {
+        let field = f
+            .get_item("field")?
+            .ok_or_else(|| PlanError::new_err("is_null filter must include 'field' key"))?
+            .extract::<String>()?;
+        return Ok(FilterPredicate::IsNull { field });
+    }
+
+    // Type check: field + op="is_type" + value (type name)
+    if op == "is_type" {
+        let field = f
+            .get_item("field")?
+            .ok_or_else(|| PlanError::new_err("is_type filter must include 'field' key"))?
+            .extract::<String>()?;
+        let type_str = f
+            .get_item("value")?
+            .ok_or_else(|| PlanError::new_err("is_type filter must include 'value' key"))?
+            .extract::<String>()?;
+        let field_type = FieldType::from_str(&type_str).ok_or_else(|| {
+            let valid = "string, int64, float64, bool, dictionary, date32, timestamp, decimal128";
+            PlanError::new_err(format!(
+                "unknown field type '{type_str}' in is_type filter; valid types: {valid}"
+            ))
+        })?;
+        return Ok(FilterPredicate::IsType { field, field_type });
+    }
+
+    // Constant filter: field + op + value
+    let field = f
+        .get_item("field")?
+        .ok_or_else(|| PlanError::new_err("filter must include 'field' key"))?
+        .extract::<String>()?;
+    let value = f
+        .get_item("value")?
+        .ok_or_else(|| PlanError::new_err("filter must include 'value' key"))?
+        .extract::<String>()?;
+    Ok(match op.as_str() {
+        "!=" | "ne" => FilterPredicate::NotEqual { field, value },
+        "==" | "eq" => FilterPredicate::Equal { field, value },
+        "starts_with" => FilterPredicate::StartsWith { field, value },
+        "ends_with" => FilterPredicate::EndsWith { field, value },
+        "contains" => FilterPredicate::Contains { field, value },
+        "strip" | "lstrip" | "rstrip" | "lower" | "upper" => {
+            let cmp_op_str = if let Some(cmp) = f.get_item("cmp_op")? {
+                cmp.extract::<String>()?
+            } else {
+                "=".to_string()
+            };
+            let cop = CompareOp::from_str(&cmp_op_str).ok_or_else(|| {
+                let valid = "==, eq, !=, ne, >, gt, <, lt, >=, ge, <=, le";
+                PlanError::new_err(format!(
+                    "unsupported compare op {cmp_op_str:?}; valid: {valid}"
+                ))
+            })?;
+            match op.as_str() {
+                "strip" | "lstrip" | "rstrip" => FilterPredicate::Strip {
+                    field,
+                    op: cop,
+                    value,
+                },
+                "lower" => FilterPredicate::Lower {
+                    field,
+                    op: cop,
+                    value,
+                },
+                "upper" => FilterPredicate::Upper {
+                    field,
+                    op: cop,
+                    value,
+                },
+                _ => unreachable!(),
+            }
+        }
+        "length" => {
+            let cmp_op_str = if let Some(cmp) = f.get_item("cmp_op")? {
+                cmp.extract::<String>()?
+            } else {
+                ">".to_string()
+            };
+            let cop = CompareOp::from_str(&cmp_op_str).ok_or_else(|| {
+                let valid = "==, eq, !=, ne, >, gt, <, lt, >=, ge, <=, le";
+                PlanError::new_err(format!(
+                    "unsupported compare op {cmp_op_str:?}; valid: {valid}"
+                ))
+            })?;
+            FilterPredicate::Length {
+                field,
+                op: cop,
+                value,
+            }
+        }
+        other => {
+            let cop = CompareOp::from_str(other).ok_or_else(|| {
+                let valid = "==, eq, !=, ne, >, gt, <, lt, >=, ge, <=, le, starts_with, ends_with, contains, strip, lower, upper, length, is_null, is_type";
+                PlanError::new_err(format!(
+                    "unsupported filter op {other:?}; valid: {valid}"
+                ))
+            })?;
+            FilterPredicate::CompareLiteral {
+                field,
+                op: cop,
+                value,
+            }
+        }
+    })
+}
+
+/// crxml-specific validation, applied to every `Compare` leaf in the tree:
+/// both fields must be typed or both untyped, because the buffered per-row
+/// path cannot compare across domains.
+pub fn validate_compare_typing(
+    plan: &rypipe_core::ExecutionPlan,
+    predicate: &FilterPredicate,
+) -> PyResult<()> {
+    match predicate {
+        FilterPredicate::Compare {
+            field_a,
+            op,
+            field_b,
+        } => {
+            let resolved_a = plan.resolve_field(field_a).unwrap_or(field_a);
+            let resolved_b = plan.resolve_field(field_b).unwrap_or(field_b);
+            let ta = plan.field_types.get(resolved_a);
+            let tb = plan.field_types.get(resolved_b);
+            if matches!((ta, tb), (Some(_), None) | (None, Some(_))) {
+                return Err(PlanError::new_err(format!(
+                    "Compare filter {field_a} {op:?} {field_b}: one field is typed \
+                     ({}) and the other is untyped. Both must be typed or both \
+                     untyped. Add the missing field to field_types, or remove \
+                     the typed one.",
+                    if ta.is_some() { field_a } else { field_b }
+                )));
+            }
+            Ok(())
+        }
+        FilterPredicate::And(a, b) | FilterPredicate::Or(a, b) => {
+            validate_compare_typing(plan, a)?;
+            validate_compare_typing(plan, b)
+        }
+        FilterPredicate::Not(inner) => validate_compare_typing(plan, inner),
+        _ => Ok(()),
+    }
+}
