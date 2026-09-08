@@ -1,6 +1,26 @@
 from typing import Iterable, Iterator, Callable
 
 
+def _merge_plan_kwargs(plan_overrides: dict, kwargs: dict) -> None:
+    """Merge stage plan kwargs into the accumulated overrides.
+
+    Multiple filter-producing stages must not overwrite each other: two
+    chained ``FilterRows`` (or a combinator plus a ``FilterRows``) combine
+    with logical AND, so their specs are folded into a compound
+    ``{"and": [...]}`` spec instead of last-one-wins.
+    """
+    for key, value in kwargs.items():
+        if key == "filter" and key in plan_overrides:
+            existing = plan_overrides["filter"]
+            if isinstance(existing, dict) and set(existing) == {"and"}:
+                # Copy: never mutate a stage's own spec list.
+                plan_overrides["filter"] = {"and": [*existing["and"], value]}
+            else:
+                plan_overrides["filter"] = {"and": [existing, value]}
+        else:
+            plan_overrides[key] = value
+
+
 def plan_split(stages):
     """Split stages into (BuildPlan pushdown kwargs, remaining stages)."""
     plan_overrides = {}
@@ -9,7 +29,7 @@ def plan_split(stages):
         if hasattr(stage, "_plan_kwargs"):
             kwargs = stage._plan_kwargs()
             if kwargs is not None:
-                plan_overrides.update(kwargs)
+                _merge_plan_kwargs(plan_overrides, kwargs)
                 continue
         remaining.append(stage)
     return plan_overrides, remaining
