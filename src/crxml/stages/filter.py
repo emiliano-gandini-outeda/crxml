@@ -54,19 +54,73 @@ class _ComparePredicate:
         return bool(fn(record.get(self._field_a), record.get(self._field_b)))
 
 
+class _IsNullPredicate:
+    __slots__ = ("_field",)
+
+    def __init__(self, field: str):
+        self._field = field
+
+    def __call__(self, record: dict) -> bool:
+        return record.get(self._field) is None
+
+
+class _IsTypePredicate:
+    __slots__ = ("_field", "_field_type")
+
+    _VALID_TYPES = frozenset({
+        "string", "int64", "float64", "bool", "boolean",
+        "dictionary", "date32", "timestamp", "decimal128",
+    })
+
+    def __init__(self, field: str, field_type: str):
+        if field_type.lower() not in self._VALID_TYPES:
+            raise ValueError(
+                f"FilterRows: unsupported type {field_type!r}; "
+                f"valid types: {', '.join(sorted(self._VALID_TYPES))}"
+            )
+        self._field = field
+        self._field_type = field_type.lower()
+
+    def __call__(self, record: dict) -> bool:
+        val = record.get(self._field)
+        if val is None:
+            return False
+        if self._field_type == "int64":
+            return isinstance(val, int) and not isinstance(val, bool)
+        elif self._field_type == "float64":
+            return isinstance(val, float)
+        elif self._field_type in ("bool", "boolean"):
+            return isinstance(val, bool)
+        elif self._field_type in ("string", "dictionary"):
+            return isinstance(val, str)
+        elif self._field_type in ("date32", "timestamp"):
+            return isinstance(val, (int, str))
+        elif self._field_type == "decimal128":
+            return isinstance(val, (int, float, str))
+        return False
+
+
 class FilterRows:
     """Pipeline stage that filters records by a predicate.
 
     Accepts a callable predicate, or declarative filter arguments: a constant
-    comparison (``field``, ``op``, ``value``) or a column-vs-column comparison
-    (``field_a``, ``op``, ``field_b``).
+    comparison (``field``, ``op``, ``value``), a column-vs-column comparison
+    (``field_a``, ``op``, ``field_b``), a null check (``field``,
+    ``is_null=True``), or a type check (``field``, ``is_type="..."``).
     """
     __slots__ = ("_predicate", "_filter_spec")
 
-    def __init__(self, predicate=None, *, field=None, op=None, value=None, field_a=None, field_b=None):
+    def __init__(self, predicate=None, *, field=None, op=None, value=None, field_a=None, field_b=None,
+                 is_null=False, is_type=None):
         if predicate is not None:
             self._predicate = predicate
             self._filter_spec = None
+        elif is_null and field is not None:
+            self._filter_spec = {"field": field, "op": "is_null"}
+            self._predicate = _IsNullPredicate(field)
+        elif is_type is not None and field is not None:
+            self._filter_spec = {"field": field, "op": "is_type", "value": is_type}
+            self._predicate = _IsTypePredicate(field, is_type)
         elif field is not None and op is not None and value is not None:
             self._filter_spec = {"field": field, "op": op, "value": value}
             self._predicate = _ConstantPredicate(field, op, value)
@@ -77,9 +131,11 @@ class FilterRows:
             raise ValueError(
                 "FilterRows requires either a callable predicate or "
                 "keyword arguments (field+op+value for constant filter, "
-                "or field_a+op+field_b for column comparison). "
+                "field_a+op+field_b for column comparison, "
+                "field+is_null for null check, or field+is_type for type check). "
                 f"Got predicate={predicate!r}, field={field!r}, op={op!r}, "
-                f"value={value!r}, field_a={field_a!r}, field_b={field_b!r}"
+                f"value={value!r}, field_a={field_a!r}, field_b={field_b!r}, "
+                f"is_null={is_null!r}, is_type={is_type!r}"
             )
 
     def apply(self, record: dict) -> dict | None:
@@ -94,3 +150,132 @@ class FilterRows:
         if self._filter_spec is not None:
             return {"filter": self._filter_spec}
         return None
+
+
+def _require_filter_spec(obj, label: str) -> dict:
+    """Extract a fusable spec or raise with a helpful message."""
+    if isinstance(obj, FilterRows):
+        if obj._filter_spec is None:
+            raise ValueError(
+                f"{label} only accepts fusable filters: FilterRows with field/op/value, "
+                f"field_a/op/field_b, is_null, or is_type keyword form. "
+                f"Pass FilterRows(..., field=..., op=..., value=...) instead of a "
+                f"plain lambda/Callable."
+            )
+        return obj._filter_spec
+    if isinstance(obj, (FilterRowsAny, FilterRowsAll, FilterRowsNot)):
+        return obj._combined_spec()
+    raise TypeError(
+        f"{label} expects FilterRows or combinator instances, got {type(obj).__name__!r}"
+    )
+
+
+def _matches(obj, record: dict) -> bool:
+    """Uniform row test for FilterRows and combinators."""
+    if isinstance(obj, FilterRows):
+        return obj._predicate(record)
+    return obj.apply(record) is not None
+
+
+class FilterRowsAny:
+    """Keep rows that satisfy **any** of the given fusable filters (OR).
+
+    Each argument must be a :class:`FilterRows` built with the keyword form
+    so it can be pushed into the Rust parse loop.
+
+    Example::
+
+        FilterRowsAny(
+            FilterRows(field="Department", op="==", value="Sales"),
+            FilterRows(field="Status", op="==", value="Inactive"),
+        )
+    """
+
+    __slots__ = ("_filters", "_specs")
+
+    def __init__(self, *filters: FilterRows):
+        if len(filters) < 2:
+            raise ValueError("FilterRowsAny requires at least two filters")
+        self._filters = filters
+        self._specs = [_require_filter_spec(f, "FilterRowsAny") for f in filters]
+
+    def apply(self, record: dict) -> dict | None:
+        for f in self._filters:
+            if _matches(f, record):
+                return record
+        return None
+
+    def __call__(self, stream):
+        return (r for r in map(self.apply, stream) if r is not None)
+
+    def _combined_spec(self) -> dict:
+        return {"or": self._specs}
+
+    def _plan_kwargs(self) -> dict | None:
+        return {"filter": self._combined_spec()}
+
+
+class FilterRowsAll:
+    """Keep rows that satisfy **all** of the given fusable filters (AND).
+
+    Chaining plain ``FilterRows`` stages with ``|`` already implies AND; this
+    class makes an explicit conjunction useful inside another combinator.
+
+    Example::
+
+        FilterRowsAll(
+            FilterRows(field="Status", op="==", value="Active"),
+            FilterRows(field="Department", op="==", value="Sales"),
+        )
+    """
+
+    __slots__ = ("_filters", "_specs")
+
+    def __init__(self, *filters: FilterRows):
+        if len(filters) < 2:
+            raise ValueError("FilterRowsAll requires at least two filters")
+        self._filters = filters
+        self._specs = [_require_filter_spec(f, "FilterRowsAll") for f in filters]
+
+    def apply(self, record: dict) -> dict | None:
+        for f in self._filters:
+            if not _matches(f, record):
+                return None
+        return record
+
+    def __call__(self, stream):
+        return (r for r in map(self.apply, stream) if r is not None)
+
+    def _combined_spec(self) -> dict:
+        return {"and": self._specs}
+
+    def _plan_kwargs(self) -> dict | None:
+        return {"filter": self._combined_spec()}
+
+
+class FilterRowsNot:
+    """Negate a single fusable filter.
+
+    Example::
+
+        FilterRowsNot(FilterRows(field="Status", op="==", value="Active"))
+        # keeps rows where Status is not 'Active'
+    """
+
+    __slots__ = ("_inner", "_spec")
+
+    def __init__(self, inner: FilterRows):
+        self._inner = inner
+        self._spec = _require_filter_spec(inner, "FilterRowsNot")
+
+    def apply(self, record: dict) -> dict | None:
+        return None if _matches(self._inner, record) else record
+
+    def __call__(self, stream):
+        return (r for r in map(self.apply, stream) if r is not None)
+
+    def _combined_spec(self) -> dict:
+        return {"not": self._spec}
+
+    def _plan_kwargs(self) -> dict | None:
+        return {"filter": self._combined_spec()}
