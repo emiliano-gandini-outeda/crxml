@@ -46,6 +46,7 @@ fn auto_mmap(path: &Path, use_mmap: bool) -> bool {
 }
 
 pub mod xml;
+mod plan_kwargs;
 
 // Fast allocator: replaces the system heap for all Rust-side
 // allocations (profiling showed ~27% of CPU in malloc/free).
@@ -78,13 +79,17 @@ fn map_rypipe_err(e: rypipe_core::Error) -> PyErr {
         rypipe_core::Error::Merge(msg) => MergeError::new_err(msg),
         rypipe_core::Error::Io(io) => PyIOError::new_err(io.to_string()),
         rypipe_core::Error::Arrow(a) => PyException::new_err(format!("Arrow error: {}", a)),
+        rypipe_core::Error::Parser(msg) => XmlError::new_err(format!("Parser error: {}", msg)),
+        rypipe_core::Error::Lifetime(msg) => {
+            XmlError::new_err(format!("Parser lifetime error: {}", msg))
+        }
     }
 }
 
 fn build_plan_from_kwargs(
     field_mapping: Option<HashMap<String, String>>,
     drop_fields: Option<Vec<String>>,
-    filter: Option<HashMap<String, String>>,
+    filter: Option<Bound<'_, PyAny>>,
     field_types: Option<HashMap<String, String>>,
     dictionary_columns: Option<Vec<String>>,
     schema: Option<Vec<String>>,
@@ -124,60 +129,9 @@ fn build_plan_from_kwargs(
     }
 
     if let Some(f) = filter {
-        let op = f
-            .get("op")
-            .ok_or_else(|| PlanError::new_err("filter must include 'op' key"))?
-            .to_owned();
-        // Column-to-column filter: field_a + op + field_b
-        if f.contains_key("field_a") && f.contains_key("field_b") {
-            let field_a = f.get("field_a").unwrap().to_owned();
-            let field_b = f.get("field_b").unwrap().to_owned();
-            let cop = rypipe_core::CompareOp::from_str(&op).ok_or_else(|| {
-                let valid = ">, <, >=, <=, ==, !=";
-                PlanError::new_err(format!("unsupported compare op {op:?}; valid: {valid}"))
-            })?;
-            plan.filter = Some(rypipe_core::FilterPredicate::Compare {
-                field_a: field_a.clone(),
-                op: cop,
-                field_b: field_b.clone(),
-            });
-            // Validate: both fields must have compatible types or both untyped.
-            // A typed field vs untyped (or vice versa) would silently drop rows
-            // because the buffered per-row path cannot compare across domains.
-            let resolved_a = plan.resolve_field(&field_a).unwrap_or(&field_a);
-            let resolved_b = plan.resolve_field(&field_b).unwrap_or(&field_b);
-            let ta = plan.field_types.get(resolved_a);
-            let tb = plan.field_types.get(resolved_b);
-            match (ta, tb) {
-                (Some(_), None) | (None, Some(_)) => {
-                    return Err(PlanError::new_err(format!(
-                        "Compare filter {field_a} {op} {field_b}: one field is typed \
-                         ({}) and the other is untyped. Both must be typed or both \
-                         untyped. Add the missing field to field_types, or remove \
-                         the typed one.",
-                        if ta.is_some() { &field_a } else { &field_b }
-                    )));
-                }
-                _ => {}
-            }
-        } else {
-            let field = f
-                .get("field")
-                .ok_or_else(|| PlanError::new_err("filter must include 'field' key"))?
-                .to_owned();
-            let value = f
-                .get("value")
-                .ok_or_else(|| PlanError::new_err("filter must include 'value' key"))?
-                .to_owned();
-            plan.filter = Some(match op.as_str() {
-                "!=" | "ne" => rypipe_core::FilterPredicate::NotEqual { field, value },
-                "==" | "eq" => rypipe_core::FilterPredicate::Equal { field, value },
-                other => {
-                    let msg = format!("unsupported filter op {other:?}; use '!=' or '=='");
-                    return Err(PlanError::new_err(msg));
-                }
-            });
-        }
+        let predicate = plan_kwargs::parse_filter_spec(&f)?;
+        plan_kwargs::validate_compare_typing(&plan, &predicate)?;
+        plan.filter = Some(predicate);
     }
 
     Ok(std::sync::Arc::new(plan))
@@ -275,7 +229,7 @@ pub fn read_to_columnar(
     row_tag: Option<String>,
     field_mapping: Option<HashMap<String, String>>,
     drop_fields: Option<Vec<String>>,
-    filter: Option<HashMap<String, String>>,
+    filter: Option<Bound<'_, PyAny>>,
     field_types: Option<HashMap<String, String>>,
     dictionary_columns: Option<Vec<String>>,
     use_mmap: bool,
@@ -319,9 +273,9 @@ pub fn read_to_columnar(
 
     let mut batch = table_builder.finish().map_err(map_rypipe_err)?;
     if let Some(ref filter) = plan.filter {
-        if let rypipe_core::FilterPredicate::Compare { .. } = filter {
-            batch = rypipe_core::apply_compare_filter(batch, filter).map_err(map_rypipe_err)?;
-        }
+        // Idempotent recheck: no-op unless the tree is pure Compare/And;
+        // per-row evaluation during parse is authoritative for all trees.
+        batch = rypipe_core::apply_compare_filter(batch, filter).map_err(map_rypipe_err)?;
     }
 
     Python::with_gil(|py| record_batch_to_table(batch, py))
@@ -335,7 +289,7 @@ pub fn read_to_columnar_multi(
     num_chunks: usize,
     field_mapping: Option<HashMap<String, String>>,
     drop_fields: Option<Vec<String>>,
-    filter: Option<HashMap<String, String>>,
+    filter: Option<Bound<'_, PyAny>>,
     field_types: Option<HashMap<String, String>>,
     dictionary_columns: Option<Vec<String>>,
     use_mmap: bool,
@@ -394,9 +348,9 @@ pub fn read_to_columnar_multi(
 
     let mut batch = merged.finish().map_err(map_rypipe_err)?;
     if let Some(ref filter) = plan.filter {
-        if let rypipe_core::FilterPredicate::Compare { .. } = filter {
-            batch = rypipe_core::apply_compare_filter(batch, filter).map_err(map_rypipe_err)?;
-        }
+        // Idempotent recheck: no-op unless the tree is pure Compare/And;
+        // per-row evaluation during parse is authoritative for all trees.
+        batch = rypipe_core::apply_compare_filter(batch, filter).map_err(map_rypipe_err)?;
     }
 
     Python::with_gil(|py| record_batch_to_table(batch, py))
@@ -410,7 +364,7 @@ pub fn read_to_columnar_par(
     num_chunks: usize,
     field_mapping: Option<HashMap<String, String>>,
     drop_fields: Option<Vec<String>>,
-    filter: Option<HashMap<String, String>>,
+    filter: Option<Bound<'_, PyAny>>,
     field_types: Option<HashMap<String, String>>,
     dictionary_columns: Option<Vec<String>>,
     use_mmap: bool,
@@ -454,7 +408,7 @@ pub fn read_to_columnar_bounded(
     memory: usize,
     field_mapping: Option<HashMap<String, String>>,
     drop_fields: Option<Vec<String>>,
-    filter: Option<HashMap<String, String>>,
+    filter: Option<Bound<'_, PyAny>>,
     field_types: Option<HashMap<String, String>>,
     dictionary_columns: Option<Vec<String>>,
     schema: Option<Vec<String>>,
@@ -903,7 +857,7 @@ pub fn iter_record_batches(
     threads: Option<usize>,
     field_mapping: Option<HashMap<String, String>>,
     drop_fields: Option<Vec<String>>,
-    filter: Option<HashMap<String, String>>,
+    filter: Option<Bound<'_, PyAny>>,
     field_types: Option<HashMap<String, String>>,
     dictionary_columns: Option<Vec<String>>,
     schema: Option<Vec<String>>,
@@ -938,6 +892,8 @@ pub fn iter_record_batches(
                     (s[..s.len() - 2].to_string(), "MB")
                 } else if s.to_lowercase().ends_with("gb") {
                     (s[..s.len() - 2].to_string(), "GB")
+                } else if s.to_lowercase().ends_with("tb") {
+                    (s[..s.len() - 2].to_string(), "TB")
                 } else if s.to_lowercase().ends_with("b") {
                     (s[..s.len() - 1].to_string(), "B")
                 } else {
@@ -947,10 +903,11 @@ pub fn iter_record_batches(
                     .parse()
                     .map_err(|_| PyException::new_err(format!("invalid memory {:?}", s)))?;
                 let mult = match unit {
-                    "B" => 1,
+                    "B" => 1usize,
                     "KB" => 1024,
                     "MB" => 1024 * 1024,
                     "GB" => 1024 * 1024 * 1024,
+                    "TB" => 1024usize.pow(4),
                     _ => 1,
                 };
                 Ok(rypipe_core::MemoryBudget::new(
@@ -1014,7 +971,7 @@ pub fn discover_schema(
     row_tag: Option<String>,
     field_mapping: Option<HashMap<String, String>>,
     drop_fields: Option<Vec<String>>,
-    filter: Option<HashMap<String, String>>,
+    filter: Option<Bound<'_, PyAny>>,
     field_types: Option<HashMap<String, String>>,
     dictionary_columns: Option<Vec<String>>,
     schema: Option<Vec<String>>,
