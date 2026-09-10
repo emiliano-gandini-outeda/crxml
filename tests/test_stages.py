@@ -1,6 +1,6 @@
 import pickle
 import pytest
-from crxml import Pipeline, RenameFields, CastTypes, DropFields, FilterRows
+from crxml import Pipeline, RenameFields, CastTypes, DropFields, FilterRows, col
 from crxml.pipeline import Pipeline as PipelineCls
 from crxml.fusion import fused_iter, is_fusable
 
@@ -195,6 +195,50 @@ class TestFilterRows:
     def test_invalid_op_compare_raises(self):
         with pytest.raises(ValueError, match="unsupported operator"):
             FilterRows(field_a="x", op="xor", field_b="y")
+
+    def test_declarative_regex(self, sample_rows):
+        stage = FilterRows(field="name", op="regex", value=r"^A")
+        result = list(stage(iter(sample_rows)))
+        assert len(result) == 1
+        assert result[0]["name"] == "Alice"
+
+    def test_declarative_regex_missing_field(self, sample_rows):
+        stage = FilterRows(field="missing", op="regex", value=r"^A")
+        assert list(stage(iter(sample_rows))) == []
+
+    def test_declarative_regex_plan_kwargs(self):
+        stage = FilterRows(field="code", op="regex", value=r"^ERR\d+$")
+        assert stage._plan_kwargs() == {
+            "filter": {"field": "code", "op": "regex", "value": r"^ERR\d+$"}
+        }
+
+    def test_declarative_regex_invalid_pattern_raises(self):
+        with pytest.raises(Exception):
+            FilterRows(field="code", op="regex", value="(")
+
+    def test_expr_predicate(self, sample_rows):
+        stage = FilterRows(col("name") == "Bob")
+        assert stage._filter_spec == {"field": "name", "op": "==", "value": "Bob"}
+        result = list(stage(iter(sample_rows)))
+        assert len(result) == 1
+        assert result[0]["name"] == "Bob"
+
+    def test_expr_predicate_compound(self, sample_rows):
+        stage = FilterRows((col("age") >= "30") & col("name").startswith("C"))
+        result = list(stage(iter(sample_rows)))
+        assert len(result) == 1
+        assert result[0]["name"] == "Carol"
+
+    def test_expr_predicate_matches(self, sample_rows):
+        stage = FilterRows(col("name").matches(r"^B"))
+        result = list(stage(iter(sample_rows)))
+        assert len(result) == 1
+        assert result[0]["name"] == "Bob"
+
+    def test_expr_predicate_between(self, sample_rows):
+        stage = FilterRows(col("age").between(25, 30))
+        result = list(stage(iter(sample_rows)))
+        assert {r["name"] for r in result} == {"Alice", "Bob"}
 
 
 class TestFusable:

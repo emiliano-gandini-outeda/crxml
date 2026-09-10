@@ -63,14 +63,19 @@ DropFields(fields: list[str])
 ## FilterRows
 
 ```python
-FilterRows(predicate: Callable[[dict], bool])
+FilterRows(predicate: Callable[[dict], bool] | Predicate])
 FilterRows(field=, op=, value=)
 FilterRows(field_a=, op=, field_b=)
 ```
 
 | Param      | Type                       | Description                      |
 |------------|----------------------------|----------------------------------|
-| `predicate`| `Callable[[dict], bool]`   | Return `True` to keep the row    |
+| `predicate`| `Callable[[dict], bool]`   | Return `True` to keep the row; also accepts an expression predicate (`col("x") > 1`, see `rypipe.expr`; `col` is re-exported as `crxml.col`) |
+
+Keyword filters support `op="regex"` (regular expression search against the
+string form of the field; invalid patterns raise at construction time).
+Expression predicates support `matches(pattern)` (regex) and
+`between(lo, hi)` (inclusive range) and compose with `&`, `|`, `~`.
 
 **Fusable:** yes | **Picklable:** no (unless a module-level function)
 

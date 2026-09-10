@@ -7,7 +7,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use rypipe_core::{CompareOp, FieldType, FilterPredicate};
+use rypipe_core::{CompareOp, FieldType, FilterPredicate, RegexSpec};
 
 use crate::PlanError;
 
@@ -149,6 +149,21 @@ fn parse_leaf_spec(f: &Bound<'_, PyDict>) -> PyResult<FilterPredicate> {
         return Ok(FilterPredicate::IsNull { field });
     }
 
+    // Regex match: field + op="regex" + value (pattern)
+    if op == "regex" {
+        let field = f
+            .get_item("field")?
+            .ok_or_else(|| PlanError::new_err("regex filter must include 'field' key"))?
+            .extract::<String>()?;
+        let pattern = f
+            .get_item("value")?
+            .ok_or_else(|| PlanError::new_err("regex filter must include 'value' key"))?
+            .extract::<String>()?;
+        let re = RegexSpec::new(pattern)
+            .map_err(|e| PlanError::new_err(format!("invalid regex in filter: {e}")))?;
+        return Ok(FilterPredicate::Regex { field, re });
+    }
+
     // Type check: field + op="is_type" + value (type name)
     if op == "is_type" {
         let field = f
@@ -234,7 +249,7 @@ fn parse_leaf_spec(f: &Bound<'_, PyDict>) -> PyResult<FilterPredicate> {
         }
         other => {
             let cop = CompareOp::from_str(other).ok_or_else(|| {
-                let valid = "==, eq, !=, ne, >, gt, <, lt, >=, ge, <=, le, starts_with, ends_with, contains, strip, lower, upper, length, is_null, is_type";
+                let valid = "==, eq, !=, ne, >, gt, <, lt, >=, ge, <=, le, starts_with, ends_with, contains, strip, lower, upper, length, is_null, is_type, regex";
                 PlanError::new_err(format!(
                     "unsupported filter op {other:?}; valid: {valid}"
                 ))

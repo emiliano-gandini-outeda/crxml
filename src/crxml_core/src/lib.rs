@@ -45,8 +45,9 @@ fn auto_mmap(path: &Path, use_mmap: bool) -> bool {
     true
 }
 
-pub mod xml;
 mod plan_kwargs;
+mod py_observer;
+pub mod xml;
 
 // Fast allocator: replaces the system heap for all Rust-side
 // allocations (profiling showed ~27% of CPU in malloc/free).
@@ -94,6 +95,9 @@ fn build_plan_from_kwargs(
     dictionary_columns: Option<Vec<String>>,
     schema: Option<Vec<String>>,
     auto_dict: bool,
+    strict_types: bool,
+    max_split_chunks: Option<usize>,
+    observer: Option<Bound<'_, PyAny>>,
 ) -> PyResult<std::sync::Arc<rypipe_core::ExecutionPlan>> {
     let mut plan = rypipe_core::ExecutionPlan::new();
 
@@ -110,6 +114,11 @@ fn build_plan_from_kwargs(
     }
 
     plan.auto_dict = auto_dict;
+    plan.strict_types = strict_types;
+    plan.max_split_chunks = max_split_chunks;
+    if let Some(obs) = observer {
+        plan.observer = Some(py_observer::PyObserver::from_any(&obs)?);
+    }
 
     if let Some(ft) = field_types {
         for (name, type_str) in ft {
@@ -223,7 +232,7 @@ fn record_batches_to_table_inner(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, row_tag=None, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, use_mmap=false, schema=None, auto_dict=false, prefault=false))]
+#[pyo3(signature = (path, row_tag=None, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, use_mmap=false, schema=None, auto_dict=false, prefault=false, strict_types=None, max_split_chunks=None, observer=None))]
 pub fn read_to_columnar(
     path: String,
     row_tag: Option<String>,
@@ -236,6 +245,9 @@ pub fn read_to_columnar(
     schema: Option<Vec<String>>,
     auto_dict: bool,
     prefault: bool,
+    strict_types: Option<bool>,
+    max_split_chunks: Option<usize>,
+    observer: Option<Bound<'_, PyAny>>,
 ) -> PyResult<PyObject> {
     let plan = build_plan_from_kwargs(
         field_mapping,
@@ -245,6 +257,9 @@ pub fn read_to_columnar(
         dictionary_columns,
         schema,
         auto_dict,
+        strict_types.unwrap_or(false),
+        max_split_chunks,
+        observer,
     )?;
 
     let p = Path::new(&path);
@@ -282,7 +297,7 @@ pub fn read_to_columnar(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, row_tag=None, num_chunks=2, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, use_mmap=false, schema=None, auto_dict=false, prefault=false))]
+#[pyo3(signature = (path, row_tag=None, num_chunks=2, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, use_mmap=false, schema=None, auto_dict=false, prefault=false, strict_types=None, max_split_chunks=None, observer=None))]
 pub fn read_to_columnar_multi(
     path: String,
     row_tag: Option<String>,
@@ -296,6 +311,9 @@ pub fn read_to_columnar_multi(
     schema: Option<Vec<String>>,
     auto_dict: bool,
     prefault: bool,
+    strict_types: Option<bool>,
+    max_split_chunks: Option<usize>,
+    observer: Option<Bound<'_, PyAny>>,
 ) -> PyResult<PyObject> {
     let plan = build_plan_from_kwargs(
         field_mapping,
@@ -305,6 +323,9 @@ pub fn read_to_columnar_multi(
         dictionary_columns,
         schema,
         auto_dict,
+        strict_types.unwrap_or(false),
+        max_split_chunks,
+        observer,
     )?;
 
     let p = Path::new(&path);
@@ -357,7 +378,7 @@ pub fn read_to_columnar_multi(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, row_tag=None, num_chunks=4, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, use_mmap=false, schema=None, auto_dict=false, prefault=false))]
+#[pyo3(signature = (path, row_tag=None, num_chunks=4, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, use_mmap=false, schema=None, auto_dict=false, prefault=false, strict_types=None, max_split_chunks=None, observer=None))]
 pub fn read_to_columnar_par(
     path: String,
     row_tag: Option<String>,
@@ -371,6 +392,9 @@ pub fn read_to_columnar_par(
     schema: Option<Vec<String>>,
     auto_dict: bool,
     prefault: bool,
+    strict_types: Option<bool>,
+    max_split_chunks: Option<usize>,
+    observer: Option<Bound<'_, PyAny>>,
 ) -> PyResult<PyObject> {
     let plan = build_plan_from_kwargs(
         field_mapping,
@@ -380,6 +404,9 @@ pub fn read_to_columnar_par(
         dictionary_columns,
         schema,
         auto_dict,
+        strict_types.unwrap_or(false),
+        max_split_chunks,
+        observer,
     )?;
 
     let p = Path::new(&path);
@@ -401,7 +428,7 @@ pub fn read_to_columnar_par(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, row_tag, memory, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, schema=None, auto_dict=false, prefault=false))]
+#[pyo3(signature = (path, row_tag, memory, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, schema=None, auto_dict=false, prefault=false, strict_types=None, max_split_chunks=None, observer=None))]
 pub fn read_to_columnar_bounded(
     path: String,
     row_tag: Option<String>,
@@ -414,6 +441,9 @@ pub fn read_to_columnar_bounded(
     schema: Option<Vec<String>>,
     auto_dict: bool,
     prefault: bool,
+    strict_types: Option<bool>,
+    max_split_chunks: Option<usize>,
+    observer: Option<Bound<'_, PyAny>>,
 ) -> PyResult<PyObject> {
     let plan = build_plan_from_kwargs(
         field_mapping,
@@ -423,6 +453,9 @@ pub fn read_to_columnar_bounded(
         dictionary_columns,
         schema,
         auto_dict,
+        strict_types.unwrap_or(false),
+        max_split_chunks,
+        observer,
     )?;
     let row_tag = row_tag.unwrap_or_else(|| "Row".to_string());
 
@@ -848,7 +881,7 @@ impl PyStreamingBatchIterator {
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, row_tag=None, memory=None, batch_size=None, threads=None, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, schema=None, auto_dict=false, prefault=false, use_mmap=None))]
+#[pyo3(signature = (path, row_tag=None, memory=None, batch_size=None, threads=None, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, schema=None, auto_dict=false, prefault=false, use_mmap=None, strict_types=None, max_split_chunks=None, observer=None))]
 pub fn iter_record_batches(
     path: String,
     row_tag: Option<String>,
@@ -864,6 +897,9 @@ pub fn iter_record_batches(
     auto_dict: bool,
     prefault: bool,
     use_mmap: Option<bool>,
+    strict_types: Option<bool>,
+    max_split_chunks: Option<usize>,
+    observer: Option<Bound<'_, PyAny>>,
 ) -> PyResult<PyStreamingBatchIterator> {
     let plan = build_plan_from_kwargs(
         field_mapping,
@@ -873,6 +909,9 @@ pub fn iter_record_batches(
         dictionary_columns,
         schema,
         auto_dict,
+        strict_types.unwrap_or(false),
+        max_split_chunks,
+        observer,
     )?;
     let row_tag = row_tag.unwrap_or_else(|| "Row".to_string());
     let budget = {
@@ -886,15 +925,24 @@ pub fn iter_record_batches(
                 Ok(rypipe_core::MemoryBudget::new(val.max(1)))
             } else if let Ok(s) = mem_obj.extract::<String>(py) {
                 let s = s.trim().to_string();
-                let (num_str, unit) = if s.to_lowercase().ends_with("kb") {
+                let lower = s.to_lowercase();
+                let (num_str, unit) = if lower.ends_with("kib") {
+                    (s[..s.len() - 3].to_string(), "KiB")
+                } else if lower.ends_with("mib") {
+                    (s[..s.len() - 3].to_string(), "MiB")
+                } else if lower.ends_with("gib") {
+                    (s[..s.len() - 3].to_string(), "GiB")
+                } else if lower.ends_with("tib") {
+                    (s[..s.len() - 3].to_string(), "TiB")
+                } else if lower.ends_with("kb") {
                     (s[..s.len() - 2].to_string(), "KB")
-                } else if s.to_lowercase().ends_with("mb") {
+                } else if lower.ends_with("mb") {
                     (s[..s.len() - 2].to_string(), "MB")
-                } else if s.to_lowercase().ends_with("gb") {
+                } else if lower.ends_with("gb") {
                     (s[..s.len() - 2].to_string(), "GB")
-                } else if s.to_lowercase().ends_with("tb") {
+                } else if lower.ends_with("tb") {
                     (s[..s.len() - 2].to_string(), "TB")
-                } else if s.to_lowercase().ends_with("b") {
+                } else if lower.ends_with("b") {
                     (s[..s.len() - 1].to_string(), "B")
                 } else {
                     (s.clone(), "B")
@@ -904,10 +952,10 @@ pub fn iter_record_batches(
                     .map_err(|_| PyException::new_err(format!("invalid memory {:?}", s)))?;
                 let mult = match unit {
                     "B" => 1usize,
-                    "KB" => 1024,
-                    "MB" => 1024 * 1024,
-                    "GB" => 1024 * 1024 * 1024,
-                    "TB" => 1024usize.pow(4),
+                    "KB" | "KiB" => 1024,
+                    "MB" | "MiB" => 1024 * 1024,
+                    "GB" | "GiB" => 1024 * 1024 * 1024,
+                    "TB" | "TiB" => 1024usize.pow(4),
                     _ => 1,
                 };
                 Ok(rypipe_core::MemoryBudget::new(
@@ -965,7 +1013,7 @@ pub fn iter_record_batches(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, row_tag=None, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, schema=None, auto_dict=false))]
+#[pyo3(signature = (path, row_tag=None, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, schema=None, auto_dict=false, strict_types=None, max_split_chunks=None, observer=None))]
 pub fn discover_schema(
     path: String,
     row_tag: Option<String>,
@@ -976,6 +1024,9 @@ pub fn discover_schema(
     dictionary_columns: Option<Vec<String>>,
     schema: Option<Vec<String>>,
     auto_dict: bool,
+    strict_types: Option<bool>,
+    max_split_chunks: Option<usize>,
+    observer: Option<Bound<'_, PyAny>>,
 ) -> PyResult<Vec<String>> {
     let plan = build_plan_from_kwargs(
         field_mapping,
@@ -985,6 +1036,9 @@ pub fn discover_schema(
         dictionary_columns,
         schema,
         auto_dict,
+        strict_types.unwrap_or(false),
+        max_split_chunks,
+        observer,
     )?;
     let row_tag = row_tag.unwrap_or_else(|| "Row".to_string());
     let p = Path::new(&path);

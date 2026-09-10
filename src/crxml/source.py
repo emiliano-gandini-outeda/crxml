@@ -86,10 +86,14 @@ def _validate_filter(f: dict) -> None:
         _validate_filter(f["not"])
         return
     op = f.get("op")
-    if op is None:
+    if op is None and not ("always" in f or "not_field" in f):
         raise ValueError("filter must include an 'op' key")
     compare_ops = {">", "<", ">=", "<=", "==", "!=", "gt", "lt", "ge", "le", "eq", "ne"}
-    constant_ops = {"==", "!=", "eq", "ne"}
+    constant_ops = compare_ops | {
+        "starts_with", "ends_with", "contains",
+        "strip", "lstrip", "rstrip", "lower", "upper",
+        "length", "regex",
+    }
     if "field_a" in f or "field_b" in f:
         if not ("field_a" in f and "field_b" in f):
             raise ValueError(
@@ -112,15 +116,36 @@ def _validate_filter(f: dict) -> None:
         if "value" not in f:
             raise ValueError("is_type filter must include a 'value' key")
         return
+    if op in ("in", "not_in"):
+        if "values" not in f:
+            raise ValueError(f"{op} filter must include a 'values' key")
+        return
+    if "old" in f and "new" in f:
+        if "value" not in f:
+            raise ValueError("replace filter must include a 'value' key")
+        cmp_op = f.get("cmp_op", op)
+        if cmp_op not in compare_ops:
+            raise ValueError(
+                f"unsupported compare op {cmp_op!r}; valid ops: "
+                f"> < >= <= == != (or gt lt ge le eq ne)"
+            )
+        return
     if "value" not in f:
         raise ValueError(
             "filter requires either 'field' + 'op' + 'value', or "
             "'field_a' + 'op' + 'field_b'"
         )
+    if op == "regex":
+        try:
+            re.compile(f["value"])
+        except re.error as e:
+            raise ValueError(f"invalid regex in filter: {e}") from e
+        return
     if op not in constant_ops:
         raise ValueError(
             f"unsupported constant-filter op {op!r}; valid ops: "
-            f"'=='/'eq', '!='/'ne'"
+            f"> < >= <= == != (or gt lt ge le eq ne), starts_with, ends_with, "
+            f"contains, strip, lstrip, rstrip, lower, upper, length, regex"
         )
 
 
@@ -141,6 +166,7 @@ class CrystalXMLSource(Adapter):
         "_engine_desired",
         "_num_chunks",
         "_memory",
+        "_max_split_chunks",
         "_schema_discovered",
     )
 
@@ -159,12 +185,16 @@ class CrystalXMLSource(Adapter):
         dictionary_columns: Optional[list[str]] = None,
         schema: Optional[list[str]] = None,
         auto_dict: bool = False,
+        strict_types: bool = False,
+        max_split_chunks: Optional[int] = None,
+        observer: Optional[dict] = None,
         use_mmap: bool = True,
         batch_size: int = 1024,
     ):
         # Store adapter-specific kwargs before calling super().__init__
         self._row_tag = row_tag
         self._memory = _parse_memory(memory)
+        self._max_split_chunks = max_split_chunks
 
         # Call Source.__init__ for standard kwargs (path, field_mapping, etc.)
         super().__init__(
@@ -176,6 +206,8 @@ class CrystalXMLSource(Adapter):
             dictionary_columns=dictionary_columns,
             schema=schema,
             auto_dict=auto_dict,
+            strict_types=strict_types,
+            observer=observer,
             use_mmap=use_mmap,
             batch_size=batch_size,
         )
@@ -263,6 +295,12 @@ class CrystalXMLSource(Adapter):
         if self._schema:
             kwargs["schema"] = self._schema
         kwargs["auto_dict"] = self._auto_dict
+        if self._strict_types:
+            kwargs["strict_types"] = True
+        if self._max_split_chunks is not None:
+            kwargs["max_split_chunks"] = self._max_split_chunks
+        if self._observer:
+            kwargs["observer"] = dict(self._observer)
         return kwargs
 
     def _build_bounded_kwargs(self) -> dict:
@@ -274,6 +312,9 @@ class CrystalXMLSource(Adapter):
             "dictionary_columns": self._dictionary_columns or None,
             "schema": self._schema or None,
             "auto_dict": self._auto_dict,
+            "strict_types": self._strict_types,
+            "max_split_chunks": self._max_split_chunks,
+            "observer": dict(self._observer) if self._observer else None,
             "prefault": False,
         }
 

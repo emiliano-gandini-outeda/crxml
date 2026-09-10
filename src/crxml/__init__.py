@@ -17,6 +17,7 @@ __all__ = [
     "FilterRowsAll",
     "FilterRowsNot",
     "DropFields",
+    "col",
     "to_arrow",
     "to_pandas",
     "to_dataframe",
@@ -56,6 +57,9 @@ def __getattr__(name):
     if name in _core_exceptions:
         from crxml import _crxml_core as _core
         return getattr(_core, name)
+    if name == "col":
+        from rypipe import col
+        return col
     if name in _modules:
         mod = importlib.import_module(_modules[name], __package__)
         return getattr(mod, name)

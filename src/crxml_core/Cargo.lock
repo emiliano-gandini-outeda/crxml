@@ -854,6 +854,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "rayon",
+ "regex",
  "rustc-hash",
  "simdutf8",
  "smallvec",

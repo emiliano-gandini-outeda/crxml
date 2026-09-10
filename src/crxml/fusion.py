@@ -1,13 +1,25 @@
 from typing import Iterable, Iterator, Callable
 
 
+def _chain_hooks(fns):
+    """Compose several callables for the same observer hook into one."""
+
+    def chained(*args):
+        for fn in fns:
+            fn(*args)
+
+    return chained
+
+
 def _merge_plan_kwargs(plan_overrides: dict, kwargs: dict) -> None:
     """Merge stage plan kwargs into the accumulated overrides.
 
     Multiple filter-producing stages must not overwrite each other: two
     chained ``FilterRows`` (or a combinator plus a ``FilterRows``) combine
     with logical AND, so their specs are folded into a compound
-    ``{"and": [...]}`` spec instead of last-one-wins.
+    ``{"and": [...]}`` spec instead of last-one-wins.  ``observer`` hook
+    dicts merge per-hook, chaining callables when several stages provide
+    the same hook.
     """
     for key, value in kwargs.items():
         if key == "filter" and key in plan_overrides:
@@ -17,6 +29,13 @@ def _merge_plan_kwargs(plan_overrides: dict, kwargs: dict) -> None:
                 plan_overrides["filter"] = {"and": [*existing["and"], value]}
             else:
                 plan_overrides["filter"] = {"and": [existing, value]}
+        elif key == "observer" and key in plan_overrides:
+            existing = plan_overrides["observer"]
+            for hook, fn in value.items():
+                if hook in existing:
+                    existing[hook] = _chain_hooks([existing[hook], fn])
+                else:
+                    existing[hook] = fn
         else:
             plan_overrides[key] = value
 
